@@ -3,62 +3,138 @@ use std::cmp::Ordering;
 use std::fmt::{self, Debug};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
+use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use std::{mem, ptr};
 
 use futures::channel::{mpsc, oneshot};
-use futures::future::{self, BoxFuture, FutureExt};
+use futures::future::{self, BoxFuture, FutureExt, FusedFuture};
 use futures::select_biased;
-use futures::stream::{FuturesUnordered, StreamExt};
-use futures::task::{Spawn, SpawnError, SpawnExt};
+use futures::stream::{FuturesUnordered, Stream, StreamExt};
+use futures::task::{Context, Poll, Spawn, SpawnError, SpawnExt};
 
 use crate::{send, Actor, Produces, Termination};
 
 type MutItem<T> = Box<dyn for<'a> FnOnce(&'a mut T) -> BoxFuture<'a, bool> + Send>;
 type FutItem = BoxFuture<'static, ()>;
 
-async fn mutex_task<T>(
+async fn mutex_task<T: Actor>(
     value: T,
-    mut mut_channel: mpsc::UnboundedReceiver<MutItem<T>>,
-    mut fut_channel: mpsc::UnboundedReceiver<FutItem>,
+    mut actions: Actions<T>,
 ) {
-    let mut futs = FuturesUnordered::new();
     // Re-bind 'value' so that it is dropped before futs.
     // That will ensure .termination() completes only once the value's drop has finished.
     let mut value = value;
     loop {
-        // Obtain an item
-        let current_item = loop {
-            if select_biased! {
-                _ = futs.select_next_some() => false,
-                item = mut_channel.next() => if let Some(item) = item {
-                    break item
-                } else {
-                    true
-                },
-                item = fut_channel.select_next_some() => {
-                    futs.push(item);
-                    false
-                },
-                complete => true,
-            } {
-                return;
-            }
-        };
-
-        // Wait for the current item to run
-        let mut current_future = current_item(&mut value).fuse();
-        loop {
-            select_biased! {
-                done = current_future => if done {
-                    return;
-                } else {
-                    break
-                },
-                _ = futs.select_next_some() => {},
-                item = fut_channel.select_next_some() => futs.push(item),
-            }
+        let method = actions.next().await;
+        if actions.method(method, &mut value).await {
+            break;
         }
+    }
+}
+
+/// Actions (events) bound for the Actor.
+pub struct Actions<T: Actor> {
+    mut_channel: mpsc::UnboundedReceiver<MutItem<T>>,
+    fut_channel: mpsc::UnboundedReceiver<FutItem>,
+    futs: FuturesUnordered<FutItem>,
+}
+
+impl<T: Actor> Actions<T> {
+    fn new(
+        mut_channel: mpsc::UnboundedReceiver<MutItem<T>>,
+        fut_channel: mpsc::UnboundedReceiver<FutItem>,
+    ) -> Self {
+        Actions {
+            mut_channel,
+            fut_channel,
+            futs: FuturesUnordered::new(),
+        }
+    }
+
+    /// Run actions in parallel with method(this) until the latter completes.
+    pub async fn method<'a>(
+        &'a mut self,
+        method: Option<MutItem<T>>,
+        this: &'a mut T,
+    ) -> bool {
+        if let Some(method) = method {
+            let mut method_fut = method(this).fuse();
+            let mut action = self;
+            loop {
+                select_biased! {
+                    done = method_fut => {
+                        break done;
+                    },
+                    _ = action => {},
+                }
+            }
+        } else {
+            true
+        }
+    }
+}
+
+impl<T: Actor> Stream for Actions<T> {
+    type Item = MutItem<T>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>)
+        -> Poll<Option<Self::Item>> {
+
+        let Actions {
+            ref mut mut_channel,
+            ref mut fut_channel,
+            ref mut futs,
+        } = self.get_mut();
+
+        loop {
+            if let Poll::Ready(method) = mut_channel.poll_next_unpin(cx) {
+                return Poll::Ready(method);
+            }
+
+            if let Poll::Ready(Some(_)) = futs.poll_next_unpin(cx) {
+                continue;
+            }
+
+            if let Poll::Ready(Some(fut)) = fut_channel.poll_next_unpin(cx) {
+                futs.push(fut);
+                continue;
+            }
+
+            break;
+        }
+
+        Poll::Pending
+    }
+}
+
+impl<T: Actor> Future for Actions<T> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>)
+        -> Poll<Self::Output> {
+        let Actions {
+            ref mut fut_channel,
+            ref mut futs,
+            ..
+        } = self.get_mut();
+
+        if let Poll::Ready(Some(_)) = futs.poll_next_unpin(cx) {
+            return Poll::Ready(());
+        }
+
+        if let Poll::Ready(Some(fut)) = fut_channel.poll_next_unpin(cx) {
+            futs.push(fut);
+            return Poll::Ready(());
+        }
+
+        Poll::Pending
+    }
+}
+
+impl<T: Actor> FusedFuture for Actions<T> {
+    fn is_terminated(&self) -> bool {
+        false
     }
 }
 
@@ -280,10 +356,16 @@ impl<T: Actor + ?Sized> AddrLike for Addr<T> {
 
 impl<T: Actor> Addr<T> {
     /// Spawn an actor using the given spawner. If successful returns the address of the actor.
-    pub fn new<S: Spawn + ?Sized>(spawner: &S, value: T) -> Result<Self, SpawnError> {
+    pub fn new<S: Spawn + ?Sized>(spawner: &S, value: T,) -> Result<Self, SpawnError> {
+        let (addr, actions) = Self::new_actions();
+        spawner.spawn(mutex_task(value, actions))?;
+        Ok(addr)
+    }
+
+    /// Return (addr, actions) for the Actor.
+    pub fn new_actions() -> (Self, Actions<T>) {
         let (mtx, mrx) = mpsc::unbounded();
         let (ftx, frx) = mpsc::unbounded();
-        spawner.spawn(mutex_task(value, mrx, frx))?;
         let addr = Self {
             inner: Some(Arc::new(AddrInner {
                 mut_channel: mtx,
@@ -295,8 +377,8 @@ impl<T: Actor> Addr<T> {
 
         // Tell the actor its own address
         send!(addr.started(addr.clone()));
-
-        Ok(addr)
+        let actions = Actions::new(mrx, frx);
+        (addr, actions)
     }
     #[doc(hidden)]
     pub fn upcast<U: ?Sized + Send + 'static, F: Fn(&mut T) -> &mut U + Copy + Send + 'static>(
