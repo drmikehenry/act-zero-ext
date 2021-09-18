@@ -175,7 +175,7 @@ mod tests {
     // rt-threaded feature.
     #[tokio::test]
     async fn wait_drop_test() {
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
         struct WaitDrop {
             tx: std::sync::mpsc::SyncSender<u32>,
         }
