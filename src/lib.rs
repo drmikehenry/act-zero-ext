@@ -30,7 +30,7 @@
 //!     }
 //! }
 //!
-//! fn main() -> Result<(), Box<dyn Error>> {
+//! fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 //!     let mut pool = LocalPool::new();
 //!     let spawner = pool.spawner();
 //!     pool.run_until(async move {

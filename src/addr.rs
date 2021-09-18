@@ -196,10 +196,10 @@ pub trait AddrLike: Send + Sync + Clone + Debug + 'static + AsAddr<Addr = Self> 
     /// Spawn a future onto the actor and provide the means to get back
     /// the result. The future will be cancelled if the receiver is
     /// dropped before it has completed.
-    fn call_fut<R: Send + 'static>(
+    fn call_fut<R: Send + 'static, E: From<crate::actor::Canceled> + Send + 'static>(
         &self,
-        fut: impl Future<Output = Produces<R>> + Send + 'static,
-    ) -> Produces<R> {
+        fut: impl Future<Output = Produces<R, E>> + Send + 'static,
+    ) -> Produces<R, E> {
         let (mut tx, rx) = oneshot::channel();
         self.send_fut(async move {
             select_biased! {
@@ -218,10 +218,14 @@ pub trait AddrLike: Send + Sync + Clone + Debug + 'static + AsAddr<Addr = Self> 
     }
 
     /// Equivalent to `call_fut` but provides access to the actor's address.
-    fn call_fut_with<R: Send + 'static, F: Future<Output = Produces<R>> + Send + 'static>(
+    fn call_fut_with<
+        R: Send + 'static,
+        E: From<crate::actor::Canceled> + Send + 'static,
+        F: Future<Output = Produces<R, E>> + Send + 'static
+    >(
         &self,
         f: impl FnOnce(Self) -> F,
-    ) -> Produces<R> {
+    ) -> Produces<R, E> {
         self.call_fut(f(self.clone()))
     }
 

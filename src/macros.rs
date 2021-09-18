@@ -80,8 +80,13 @@ macro_rules! __impl_send {
                 $crate::hidden::trace!("{}::{}(...)", $crate::hidden::type_name_of_val(x).as_display(), stringify!($method));
                 $crate::hidden::FutureExt::boxed(async move {
                     let _addr = addr2;
-                    if let Err(e) = $crate::IntoActorResult::into_actor_result(x.$method($($moved),*).await) {
-                        $crate::Actor::error(x, e).await
+                    let result = $crate::IntoActorResult::into_actor_result(x.$method($($moved),*).await);
+                    let produces = match result {
+                        Ok(produces) => produces,
+                        Err(error) => $crate::Produces::Error(error),
+                    };
+                    if let Some(error) = produces.into_some_error() {
+                        $crate::Actor::error(x, error.into()).await
                     } else {
                         false
                     }
@@ -104,12 +109,20 @@ macro_rules! __impl_send {
                 $crate::hidden::trace!("{}::{}(...)", $crate::hidden::type_name_of_val(x).as_display(), stringify!($method));
                 $crate::hidden::FutureExt::boxed(async move {
                     let _addr = addr2;
-                    match $crate::IntoActorResult::into_actor_result(x.$method($($moved),*).await) {
-                        Ok(x) => {
-                            let _ = tx.send(x);
-                            false
+                    let result = $crate::IntoActorResult::into_actor_result(x.$method($($moved),*).await);
+                    let produces = match result {
+                        Ok(produces) => produces,
+                        Err(error) => $crate::Produces::Error(error),
+                    };
+                    match tx.send(produces) {
+                        Ok(_) => false,
+                        Err(produces) => {
+                            if let Some(error) = produces.into_some_error() {
+                                $crate::Actor::error(x, error.into()).await
+                            } else {
+                                false
+                            }
                         }
-                        Err(e) => $crate::Actor::error(x, e).await,
                     }
                 })
             }));

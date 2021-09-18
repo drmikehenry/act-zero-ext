@@ -14,45 +14,72 @@ use crate::Addr;
 /// The type of error returned by an actor method.
 pub type ActorError = Box<dyn Error + Send + Sync>;
 /// Short alias for a `Result<Produces<T>, ActorError>`.
-pub type ActorResult<T> = Result<Produces<T>, ActorError>;
+pub type ActorResult<T, E=ActorError> = Result<Produces<T, E>, E>;
 
-/// A concrete type similar to a `BoxFuture<'static, Result<T, oneshot::Canceled>>`, but
+/// An error indicating failure to deliver a method's result to the caller.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Canceled;
+
+impl std::fmt::Display for Canceled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Canceled")
+    }
+}
+
+impl std::error::Error for Canceled {}
+
+/// A concrete type similar to a `BoxFuture<'static, Result<T, Canceled>>`, but
 /// without requiring an allocation if the value is immediately ready.
 /// This type implements the `Future` trait and can be directly `await`ed.
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum Produces<T> {
+pub enum Produces<T, E=ActorError>
+where
+    E: From<Canceled>
+{
     /// No value was produced.
     None,
     /// A value is ready.
     Value(T),
+    /// An error is ready.
+    Error(E),
     /// A value may be sent in the future.
-    Deferred(oneshot::Receiver<Produces<T>>),
+    Deferred(oneshot::Receiver<Produces<T, E>>),
 }
 
-impl<T> Unpin for Produces<T> {}
+impl<T, E: From<Canceled>> Unpin for Produces<T, E> {}
 
-impl<T> Produces<T> {
+impl<T, E: From<Canceled>> Produces<T, E> {
     /// Returns `Ok(Produces::Value(value))`
-    pub fn ok(value: T) -> ActorResult<T> {
+    pub fn ok(value: T) -> ActorResult<T, E> {
         Ok(Produces::Value(value))
+    }
+
+    /// Convert into an error if possible.
+    pub fn into_some_error(self) -> Option<E> {
+        match self {
+            Self::None => Some(Canceled.into()),
+            Self::Error(error) => Some(error),
+            _ => None,
+        }
     }
 }
 
-impl<T> Future for Produces<T> {
-    type Output = Result<T, oneshot::Canceled>;
+impl<T, E: From<Canceled>> Future for Produces<T, E> {
+    type Output = Result<T, E>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
             break match mem::replace(&mut *self, Produces::None) {
-                Produces::None => Poll::Ready(Err(oneshot::Canceled)),
+                Produces::None => Poll::Ready(Err(Canceled.into())),
                 Produces::Value(value) => Poll::Ready(Ok(value)),
+                Produces::Error(error) => Poll::Ready(Err(error)),
                 Produces::Deferred(mut recv) => match recv.poll_unpin(cx) {
                     Poll::Ready(Ok(producer)) => {
                         *self = producer;
                         continue;
                     }
-                    Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                    Poll::Ready(Err(_)) => Poll::Ready(Err(Canceled.into())),
                     Poll::Pending => {
                         *self = Produces::Deferred(recv);
                         Poll::Pending
@@ -115,20 +142,27 @@ pub trait Actor: Send + 'static {
 pub trait IntoActorResult {
     /// The type to be sent back to the caller.
     type Output;
+    /// The error type to be sent back to the caller.
+    type Error: From<Canceled> + Into<ActorError>;
     /// Perform the conversion to an ActorResult.
-    fn into_actor_result(self) -> ActorResult<Self::Output>;
+    fn into_actor_result(self) -> ActorResult<Self::Output, Self::Error>;
 }
 
-impl<T> IntoActorResult for ActorResult<T> {
+impl<T, E> IntoActorResult for ActorResult<T, E>
+where
+    E: From<Canceled> + Into<ActorError>,
+{
     type Output = T;
-    fn into_actor_result(self) -> ActorResult<T> {
+    type Error = E;
+    fn into_actor_result(self) -> ActorResult<T, E> {
         self
     }
 }
 
 impl IntoActorResult for () {
     type Output = ();
-    fn into_actor_result(self) -> ActorResult<()> {
+    type Error = Canceled;
+    fn into_actor_result(self) -> ActorResult<(), Self::Error> {
         Produces::ok(())
     }
 }
